@@ -1,0 +1,49 @@
+@import url('https://fonts.googleapis.com/css2?family=Fira+Code:wght@400;500;600;700&family=Inter:wght@400;500;600;700;800;900&family=Outfit:wght@300;400;500;600;700;800;900&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  body {
+    @apply bg-[#050505] text-white font-sans antialiased overflow-hidden selection:bg-blue-500/30;
+  }
+}
+
+/* Custom Scrollbar for sleekness */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.2);
+  border-radius: 10px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.4);
+}
+
+/* Glassmorphism utilities */
+.glass-panel {
+  @apply bg-[#0f1115]/80 backdrop-blur-md border border-white/10 shadow-xl;
+}
+
+.glass-card {
+  @apply bg-[#15171c]/90 backdrop-blur-sm border border-white/5 shadow-lg relative overflow-hidden;
+}
+
+.glass-card::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 1px;
+  background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.1), transparent);
+}
