@@ -1,4 +1,4 @@
-import { useEffect, useRef, useCallback } from 'react';
+import { useEffect, useRef } from 'react';
 import { megaTraderAPI } from '../utils/megaTraderAPI';
 
 /**
@@ -30,18 +30,36 @@ export const useAutomationEngine = ({
     const latestDepthData = useRef(depthData);
     const priceLevels = useRef({});
     const lastProcessedTimes = useRef({});
+    const engineStartTime = useRef(0); // Records when engine was most recently enabled
 
     // Always keep ref updated with the most recent tick, to detach from React render cycles in our interval
     useEffect(() => {
         latestDepthData.current = depthData;
     }, [depthData]);
 
+    // Record startup timestamp so the poll loop can skip the warmup window
+    useEffect(() => {
+        if (isAutomationEnabled) {
+            engineStartTime.current = Date.now();
+        }
+    }, [isAutomationEnabled]);
+
     useEffect(() => {
         if (monitoredTokens.length === 0) return;
 
+        // Capture ref for the cleanup function
+        const currentAccumulations = activeAccumulations.current;
+
         const pollInterval = setInterval(() => {
-            // Verify Socket connectivity
+            // Check automation toggle and Socket connectivity
+            if (!isAutomationEnabled) return;
             if (status !== 'Connected' && status !== 'CONNECTED' && status !== 'connected') return;
+
+            // --- WARMUP GUARD ---
+            // Skip the first 2 seconds after engine start to avoid firing on
+            // stale pre-buffered market data that accumulated while engine was off.
+            const WARMUP_MS = 2000;
+            if (Date.now() - engineStartTime.current < WARMUP_MS) return;
 
             const currentData = latestDepthData.current;
 
@@ -60,7 +78,7 @@ export const useAutomationEngine = ({
 
                 const sides = item.side === 'both' ? ['buy', 'sell'] : [item.side];
 
-                sides.forEach(side => {
+                sides.forEach(async side => {
                     const internalSide = side === 'buy' ? 'bid' : 'ask';
                     const depths = depth.depths || [];
                     const qualifyingDepths = depths.filter(d => {
@@ -68,34 +86,52 @@ export const useAutomationEngine = ({
                         return qty > 0; // Examine all available depths to see updates against thresholds
                     });
 
-                    qualifyingDepths.forEach(matchingDepth => {
-                        const observedQty = internalSide === 'bid' ? matchingDepth.BQ : matchingDepth.SQ;
+                    qualifyingDepths.forEach(async matchingDepth => {
+                        const observedQty = Number(internalSide === 'bid' ? matchingDepth.BQ : matchingDepth.SQ);
                         const price = internalSide === 'bid' ? matchingDepth.BP : matchingDepth.SP;
                         const priceVal = parseFloat(price);
 
                         const now = Date.now();
 
-                        // Independent Automation Trigger & Accumulation Map
+                        // Shared cooldown state for this token+side.
+                        // autoState is a REFERENCE — mutating it synchronously (before await) is visible
+                        // to all sibling depth-level iterations in the same forEach call.
                         const autoLevelKey = `${item.id}_${side}_auto`;
-                        const autoState = priceLevels.current[autoLevelKey] || { lastOrderTime: 0 };
-                        const autoTimeDiff = now - autoState.lastOrderTime;
+                        if (!priceLevels.current[autoLevelKey]) {
+                            priceLevels.current[autoLevelKey] = { lastOrderTime: 0 };
+                        }
+                        const autoState = priceLevels.current[autoLevelKey];
+
+                        // Re-read lastOrderTime freshly each time — prevents duplicate orders when
+                        // multiple depth levels pass the check before anyone sets the cooldown.
+                        const autoTimeDiff = Date.now() - autoState.lastOrderTime;
 
                         if (isAutomationEnabled && autoTimeDiff > 5000) { // 5s universal cooldown per side
                             const accumKey = `${item.id}_${side}`;
                             let currentAccum = activeAccumulations.current[accumKey];
 
-                            // Bypass timer if logic says 0 seconds or 0 target limit 
+                            // Bypass timer if logic says 0 seconds or 0 target limit
                             const bypassTimer = !timerSeconds || timerSeconds <= 0 || !targetTotalQty || targetTotalQty <= 0;
 
                             // LOGIC 1: Hard Instant Limit Override
                             // Regardless of timers or target configs, if the single tick observes massive volume >= 100,000, FIRE INSTANTLY.
                             const crossHardLimit = observedQty >= 100000;
 
-                            // LOGIC 3: Dynamic Lot Calculation
-                            // Nifty = 65, Sensex = 20. Divide qty by lot size, take percentage, multiply back.
-                            const lotBase = item.index === 'SENSEX' ? 20 : 65;
-                            const calculatedLotSize = Math.floor((observedQty / lotBase) * (autoOrderSlicePercentage / 100) * lotBase);
-                            const actualExecutionQty = Math.max(lotBase, calculatedLotSize); // At least execute minimum lot
+                            // lotBase for rounding: NIFTY=65, SENSEX=20, BANKNIFTY=15, FINNIFTY=40
+                            let lotBase = 65;
+                            if (item.index === 'SENSEX' || item.index === 'BSX') lotBase = 20;
+                            if (item.index === 'BANKNIFTY') lotBase = 15;
+                            if (item.index === 'FINNIFTY') lotBase = 40;
+
+                            // Step 1: get raw intermediate value (e.g. 31 for sliceQty=2000, lotBase=65)
+                            // Step 2: snap that value to the nearest multiple of lotBase
+                            //   - 31 → Math.round(31/65)*65 = 0 → max(65, 0) = 65
+                            //   - 65 → Math.round(65/65)*65 = 65 → 65
+                            //   - 130 → Math.round(130/65)*65 = 130 → 130
+                            const snapToNearestLot = (val, base) => Math.max(base, Math.round(val / base) * base);
+                            const targetSliceQty = observedQty * (autoOrderSlicePercentage / 100);
+                            const rawLots = Math.round(targetSliceQty / lotBase);
+                            const actualExecutionQty = snapToNearestLot(rawLots, lotBase);
 
                             // LOGIC 2: 0.20 Price Slippage
                             // Only apply 0.20 paise difference to price execution if we crossed the 100,000 extreme limit
@@ -105,32 +141,45 @@ export const useAutomationEngine = ({
                             }
 
                             if (bypassTimer || crossHardLimit) {
-                                // --- Instant Execution ---
-                                if (observedQty >= autoOrderThreshold || crossHardLimit) {
-                                    console.log(`[Autobot] Auto-triggering order | Signal: ${observedQty} @ ${priceVal} | Executing Qty: ${actualExecutionQty} | Slippage Price: ${executionPrice}`);
+                                // --- CRITICAL: Immediate Cooldown Update ---
+                                // Set this BEFORE the await to prevent subsequent interval ticks (every 100ms)
+                                // from re-triggering while this call is in flight.
+                                autoState.lastOrderTime = Date.now();
+                                priceLevels.current[autoLevelKey] = autoState;
 
-                                    const details = {
-                                        index: item.index, strike: item.strike, type: item.type,
-                                        side, observedQty, price: executionPrice, time: new Date().toLocaleTimeString(),
-                                        timestamp: now, tokenId: item.id, tkn: item.tkn,
-                                        executionQty: actualExecutionQty,
-                                        triggerPrice: triggerPriceValue > 0 ? Number((side === 'buy' ? priceVal - triggerPriceValue : priceVal + triggerPriceValue).toFixed(2)) : 0
-                                    };
+                                console.log(`[Autobot] Auto-triggering order | Signal: ${observedQty} @ ${priceVal} | Executing Qty: ${actualExecutionQty} | Slippage Price: ${executionPrice}`);
 
-                                    megaTraderAPI.triggerOrder(details);
+                                const details = {
+                                    index: item.index, strike: item.strike, type: item.type,
+                                    side, observedQty, price: executionPrice, time: new Date().toLocaleTimeString(),
+                                    timestamp: now, tokenId: item.id, tkn: item.tkn,
+                                    executionQty: actualExecutionQty,
+                                    triggerPrice: triggerPriceValue > 0 ? Number((side === 'buy' ? priceVal - triggerPriceValue : priceVal + triggerPriceValue).toFixed(2)) : 0
+                                };
 
-                                    if (onLogEvent) {
-                                        onLogEvent(`Order Executed for ${item.index} ${item.strike} ${item.type} | Qty: ${actualExecutionQty} (based on ${autoOrderSlicePercentage}%) @ ${executionPrice}`, 'success', {
+                                const result = await megaTraderAPI.triggerOrder(details);
+
+                                // Guard: Only update UI/Logs if automation is still enabled
+                                if (onLogEvent) {
+                                    // result.Error===null is the ONLY reliable success indicator.
+                                    // Exchange returns IntOrdNo on BOTH success AND rejection.
+                                    const finalStatus = result && result.Error === null
+                                        ? (crossHardLimit ? '1 LAC EXEC' : 'INSTANT EXEC')
+                                        : 'FAILED';
+                                    const errorMsg = result && result.Error ? ` | Error: ${result.Error}` : '';
+
+                                    onLogEvent(`Order ${finalStatus === 'FAILED' ? 'FAILED' : 'Executed'} for ${item.index} ${item.strike} ${item.type} | Qty: ${actualExecutionQty}@${executionPrice}${errorMsg}`,
+                                        finalStatus === 'FAILED' ? 'error' : 'success',
+                                        {
                                             token: `${item.index} ${item.strike} ${item.type}`,
                                             side: side.toUpperCase(),
                                             qty: observedQty,
                                             price: executionPrice,
-                                            status: crossHardLimit ? '1 LAC EXEC' : 'INSTANT EXEC'
-                                        });
-                                    }
-
-                                    autoState.lastOrderTime = now;
-                                    priceLevels.current[autoLevelKey] = autoState;
+                                            status: finalStatus,
+                                            intOrdNo: result?.IntOrdNo || null,
+                                            id: details.id
+                                        }
+                                    );
                                 }
                             } else {
                                 // --- Timer Sequence Logic ---
@@ -173,24 +222,27 @@ export const useAutomationEngine = ({
                                     if (observedQty >= autoOrderThreshold) {
                                         currentAccum.accumulatedQty += observedQty;
                                         console.log(`[Autobot] Accumulating... Added: ${observedQty}. New Total: ${currentAccum.accumulatedQty}/${targetTotalQty}`);
-                                        if (onLogEvent) {
-                                            onLogEvent(`Added ${observedQty}. Total: ${currentAccum.accumulatedQty}/${targetTotalQty}`, 'info', {
-                                                token: `${item.index} ${item.strike} ${item.type}`,
-                                                side: side.toUpperCase(),
-                                                qty: observedQty,
-                                                price: priceVal,
-                                                status: 'ADDED'
-                                            });
-                                        }
                                     }
                                 }
 
                                 if (currentAccum && currentAccum.accumulatedQty >= targetTotalQty) {
                                     // Step C: Goal is met before timer ends
 
-                                    // Re-calculate dynamic lot sizing off the *accumulated* size
-                                    const accumActualQty = Math.floor((currentAccum.accumulatedQty / lotBase) * (autoOrderSlicePercentage / 100) * lotBase);
-                                    const finalActualExecutionQty = Math.max(lotBase, accumActualQty);
+                                    // lotBase for rounding: NIFTY=65, SENSEX=20, BANKNIFTY=15, FINNIFTY=40
+                                    let lotBase = 65;
+                                    if (item.index === 'SENSEX' || item.index === 'BSX') lotBase = 20;
+                                    if (item.index === 'BANKNIFTY') lotBase = 15;
+                                    if (item.index === 'FINNIFTY') lotBase = 40;
+
+                                    // Use the LAST tick (observedQty) that completed the target — not the cumulative sum.
+                                    const snapToNearestLot = (val, base) => Math.max(base, Math.round(val / base) * base);
+                                    const lastTickSlice = observedQty * (autoOrderSlicePercentage / 100);
+                                    const rawAccumLots = Math.round(lastTickSlice / lotBase);
+                                    const finalActualExecutionQty = snapToNearestLot(rawAccumLots, lotBase);
+
+                                    // --- CRITICAL: Immediate Cooldown Update ---
+                                    autoState.lastOrderTime = Date.now();
+                                    priceLevels.current[autoLevelKey] = autoState;
 
                                     console.log(`[Autobot] Accumulation Goal Met for ${accumKey}! Total: ${currentAccum.accumulatedQty}. Targeting Execution Qty: ${finalActualExecutionQty}`);
 
@@ -204,20 +256,26 @@ export const useAutomationEngine = ({
                                         executionQty: finalActualExecutionQty,
                                         triggerPrice: triggerPriceValue > 0 ? Number((side === 'buy' ? priceVal - triggerPriceValue : priceVal + triggerPriceValue).toFixed(2)) : 0
                                     };
-                                    megaTraderAPI.triggerOrder(details);
+                                    const result = await megaTraderAPI.triggerOrder(details);
 
                                     if (onLogEvent) {
-                                        onLogEvent(`Executing order for ${item.index} ${item.strike} | Banked: ${currentAccum.accumulatedQty} | Sending: ${finalActualExecutionQty}`, 'success', {
-                                            token: `${item.index} ${item.strike} ${item.type}`,
-                                            side: side.toUpperCase(),
-                                            qty: currentAccum.accumulatedQty,
-                                            price: priceVal,
-                                            status: 'GOAL MET'
-                                        });
-                                    }
+                                        // result.Error===null = success; any Error string = failed
+                                        const finalStatus = result && result.Error === null ? 'GOAL MET' : 'FAILED';
+                                        const errorMsg = result && result.Error ? ` | Error: ${result.Error}` : '';
 
-                                    autoState.lastOrderTime = now;
-                                    priceLevels.current[autoLevelKey] = autoState;
+                                        onLogEvent(`Executing order for ${item.index} ${item.strike} | Banked: ${currentAccum.accumulatedQty} | Sending: ${finalActualExecutionQty}${errorMsg}`,
+                                            finalStatus === 'FAILED' ? 'error' : 'success',
+                                            {
+                                                token: `${item.index} ${item.strike} ${item.type}`,
+                                                side: side.toUpperCase(),
+                                                qty: currentAccum.accumulatedQty,
+                                                price: priceVal,
+                                                status: finalStatus,
+                                                intOrdNo: result?.IntOrdNo || null,
+                                                id: details.id
+                                            }
+                                        );
+                                    }
                                 }
                             }
                         }
@@ -229,7 +287,11 @@ export const useAutomationEngine = ({
         return () => {
             clearInterval(pollInterval);
             // Cleanup any active accumulation timeouts when engine disables or unmounts
-            Object.values(activeAccumulations.current).forEach(accum => clearTimeout(accum.timerId));
+            Object.values(currentAccumulations).forEach(accum => clearTimeout(accum.timerId));
+
+            // --- NEW: Explicitly wipe state to prevent leaks on restart ---
+            activeAccumulations.current = {};
+            priceLevels.current = {};
         };
     }, [monitoredTokens, status, autoOrderThreshold, isAutomationEnabled, autoOrderSlicePercentage, targetTotalQty, timerSeconds, triggerPriceValue, onLogEvent]);
 

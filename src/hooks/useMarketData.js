@@ -2,8 +2,8 @@ import { useState, useEffect, useCallback, useRef } from 'react';
 
 const WS_URL = 'ws://115.242.15.134:19101';
 const LOGIN_DATA = {
-    LoginId: "automatetestnew",
-    Password: "automatetestnew"
+    LoginId: "megatradertestnew",
+    Password: "megatradertestnew"
 };
 
 export const useMarketData = (enabled = true, onMessage = null, onDepthPacket = null) => {
@@ -24,9 +24,12 @@ export const useMarketData = (enabled = true, onMessage = null, onDepthPacket = 
 
     // Data Buffers to prevent "React Storms"
     const depthBuffer = useRef({});
-    const lastUpdate = useRef(0);
     const packetRates = useRef({});
-    const lastTelemetry = useRef(Date.now());
+    const lastTelemetry = useRef(0); // Will be initialized in useEffect
+
+    useEffect(() => {
+        lastTelemetry.current = Date.now();
+    }, []);
 
     // Keep refs updated
     useEffect(() => {
@@ -35,7 +38,8 @@ export const useMarketData = (enabled = true, onMessage = null, onDepthPacket = 
         enabledRef.current = enabled;
     }, [onMessage, onDepthPacket, enabled]);
 
-    const connect = useCallback(() => {
+    // Define standard function conceptually hoisted to the top scope
+    function connectSocket() {
         if (ws.current) {
             ws.current.onclose = null;
             ws.current.close();
@@ -61,65 +65,42 @@ export const useMarketData = (enabled = true, onMessage = null, onDepthPacket = 
 
                 // 1. Handle Login
                 if (Type === 'Login') {
-                    if (Data.Error === null) {
+                    console.log('[WS] Login Response:', Data);
+                    if (Data && Data.Error === null) {
                         console.log('[WS] Login Success');
                         isLoggedIn.current = true;
                         isReady.current = true;
 
-                        // Unified Handshake (Restored + Pending)
+                        // Resubscribe to previous tokens if any
                         const activeQuotes = Array.from(activeSubscriptions.current.values());
-                        const freshQuotes = pendingSubs.current.flat().filter(q =>
-                            !activeSubscriptions.current.has(String(q.Tkn))
-                        );
+                        const depthTokens = activeQuotes.filter(q => q.Xchg.includes('FO'));
+                        const indexTokens = activeQuotes.filter(q => !q.Xchg.includes('FO'));
 
-                        // 1. Separate tokens by Exchange
-                        // NSEFO -> FeedType 2 (Depth)
-                        // NSE (Indices) -> FeedType 1 (Touchline)
-                        const allTokens = [...activeQuotes, ...freshQuotes];
-                        const depthTokens = allTokens.filter(q => q.Xchg === 'NSEFO');
-
-                        const indexTokens = [
-                            { Tkn: '26000', Xchg: 'NSE' },
-                            { Tkn: '26009', Xchg: 'NSE' },
-                            ...allTokens.filter(q => q.Xchg === 'NSE')
-                        ].filter((v, i, a) => a.findIndex(t => t.Tkn === v.Tkn) === i); // Deduplicate
-
-                        // Send Depth Sub
                         if (depthTokens.length > 0) {
                             ws.current.send(JSON.stringify({
                                 Type: "TokenRequest",
                                 Data: { SubType: true, FeedType: 2, quotes: depthTokens }
                             }));
-                            console.log('[WS] Subscribed to Depth (FT2):', depthTokens.length);
-                            depthTokens.forEach(q => activeSubscriptions.current.set(String(q.Tkn), q));
                         }
-
-                        // Send Index/Touchline Sub
                         if (indexTokens.length > 0) {
                             ws.current.send(JSON.stringify({
                                 Type: "TokenRequest",
                                 Data: { SubType: true, FeedType: 1, quotes: indexTokens }
                             }));
-                            console.log('[WS] Subscribed to Index/Touchline (FT1):', indexTokens.map(t => t.Tkn));
-                            indexTokens.forEach(q => activeSubscriptions.current.set(String(q.Tkn), q));
                         }
-
-                        pendingSubs.current = [];
 
                         if (hbInterval.current) clearInterval(hbInterval.current);
                         hbInterval.current = setInterval(() => {
                             if (ws.current?.readyState === WebSocket.OPEN) {
                                 ws.current.send(JSON.stringify({
                                     Type: "Info",
-                                    Data: {
-                                        InfoType: "HB",
-                                        InfoMsg: "Heartbeat"
-                                    }
+                                    Data: { InfoType: "HB", InfoMsg: "Heartbeat" }
                                 }));
                             }
-                        }, 3000); // 3s Heartbeat
+                        }, 10000); // Relaxed to 10s
                     } else {
-                        console.error('[WS] Login Failed:', Data.Error);
+                        console.error('[WS] Login Failed. Error:', Data?.Error || 'Unknown Error');
+                        setStatus('error');
                     }
                     return;
                 }
@@ -186,7 +167,7 @@ export const useMarketData = (enabled = true, onMessage = null, onDepthPacket = 
         };
 
         ws.current.onclose = (event) => {
-            console.warn(`[WS] Closed: ${event.code} - ${event.reason || 'Abnormal Closure'}`);
+            console.warn(`[WS] Connection Closed | Code: ${event.code} | Reason: ${event.reason || 'None provided'}`);
             setStatus('disconnected');
             isLoggedIn.current = false;
             isReady.current = false;
@@ -196,15 +177,16 @@ export const useMarketData = (enabled = true, onMessage = null, onDepthPacket = 
             if (handshakeTimeout.current) clearTimeout(handshakeTimeout.current);
 
             if (enabledRef.current) {
-                // Modifying aggressive reconnect to prevent 1006 loops/bans
-                console.warn('[WS] Reconnecting (2000ms)...');
-                reconnectTimeout.current = setTimeout(connect, 2000);
+                console.log('[WS] Reconnecting in 5s...');
+                reconnectTimeout.current = setTimeout(connect, 5000);
             }
         };
 
         ws.current.onerror = () => setStatus('error');
+    }
 
-    }, []); // Only create connect once
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    const connect = useCallback(connectSocket, []); // Only create connect once
 
     // Watchdog State
     const activeSubscriptions = useRef(new Map()); // Map<TokenID, QuoteObject>
@@ -213,6 +195,8 @@ export const useMarketData = (enabled = true, onMessage = null, onDepthPacket = 
 
     // Watchdog Interval
     useEffect(() => {
+        // Safe access to the connect ref
+        if (!ws.current) return;
         if (!enabled) return;
 
         watchdogInterval.current = setInterval(() => {
@@ -308,13 +292,20 @@ export const useMarketData = (enabled = true, onMessage = null, onDepthPacket = 
             }
             setStatus('disconnected');
         }
+
+        // Capture refs for cleanup to fix exhaustive-deps warning
+        const currentWatchdogInterval = watchdogInterval.current;
+        const currentSyncInterval = syncInterval.current;
+        const currentHandshakeTimeout = handshakeTimeout.current;
+        const currentHbInterval = hbInterval.current;
+
         return () => {
             if (ws.current) ws.current.close();
-            if (hbInterval.current) clearInterval(hbInterval.current);
-            if (watchdogInterval.current) clearInterval(watchdogInterval.current);
+            if (currentHbInterval) clearInterval(currentHbInterval);
+            if (currentWatchdogInterval) clearInterval(currentWatchdogInterval);
             if (reconnectTimeout.current) clearTimeout(reconnectTimeout.current);
-            if (syncInterval.current) clearInterval(syncInterval.current);
-            if (handshakeTimeout.current) clearTimeout(handshakeTimeout.current);
+            if (currentSyncInterval) clearInterval(currentSyncInterval);
+            if (currentHandshakeTimeout) clearTimeout(currentHandshakeTimeout);
         };
     }, [enabled, connect]);
 
