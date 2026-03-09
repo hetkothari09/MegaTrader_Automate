@@ -145,6 +145,7 @@ class MegaTraderAPI {
                 })
             });
             const data = await response.json();
+            console.log('[MegaTrader] OrderStatus response:', JSON.stringify(data));
             return data;
         } catch (error) {
             console.warn('[MegaTrader] OrderStatus fetch failed:', error.message);

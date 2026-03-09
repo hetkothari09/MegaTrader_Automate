@@ -286,8 +286,11 @@ const OrderBook = React.memo(({ orders, onClearAll, onRemoveOne }) => {
                       <span className="text-sm font-mono font-black text-blue-400 group-hover:text-blue-300 transition-colors">{order.qty?.toLocaleString()}</span>
                     </td>
                     <td className="py-3.5 px-4 text-left">
-                      <div className="flex items-center gap-2">
-                        <span className="text-sm font-mono font-black text-amber-500/90 group-hover:text-amber-400 transition-colors">{order.price}</span>
+                      <span className="text-sm font-mono font-black text-amber-500/90 group-hover:text-amber-400 transition-colors">{order.price}</span>
+                    </td>
+                    <td className="py-3.5 px-4 pr-4 text-center">
+                      <div className="flex items-center justify-end gap-2">
+                        <ExchangeStatusBadge exStatus={order.exStatus} />
                         <button
                           onClick={() => onRemoveOne(order.id)}
                           className="opacity-0 group-hover:opacity-100 text-white/20 hover:text-rose-400 transition-all p-1.5 bg-[#0f1115] rounded-md border border-white/5 shadow-lg flex-shrink-0"
@@ -295,9 +298,6 @@ const OrderBook = React.memo(({ orders, onClearAll, onRemoveOne }) => {
                           <Trash2 size={12} />
                         </button>
                       </div>
-                    </td>
-                    <td className="py-3.5 px-4 pr-6 text-center">
-                      <ExchangeStatusBadge exStatus={order.exStatus} />
                     </td>
                   </motion.tr>
                 ))}
@@ -561,14 +561,19 @@ function App() {
   useEffect(() => {
     const interval = setInterval(async () => {
       setExecutedOrders(prev => {
-        const pending = prev.filter(o => o.intOrdNo && !TERMINAL_STATUSES.has(o.exStatus));
+        // Poll all orders that have an intOrdNo and haven't reached a terminal status
+        const pending = prev.filter(o => o.intOrdNo != null && !TERMINAL_STATUSES.has(o.exStatus));
         if (pending.length === 0) return prev;
 
         // Fire all status checks in parallel, then merge results
         Promise.all(
           pending.map(o =>
             megaTraderAPI.getOrderStatus(o.intOrdNo)
-              .then(data => ({ id: o.id, status: data?.Status || data?.status || null }))
+              .then(data => ({
+                id: o.id,
+                // API returns a plain string like "Executed", OR an object with a Status field
+                status: typeof data === 'string' ? data : (data?.Status || data?.status || null)
+              }))
               .catch(() => ({ id: o.id, status: null }))
           )
         ).then(results => {
@@ -581,7 +586,7 @@ function App() {
 
         return prev; // Return unmodified while async runs
       });
-    }, 3000);
+    }, 2000);  // 2s interval — fast enough to catch EPending → Executed transitions
 
     return () => clearInterval(interval);
   }, []);
